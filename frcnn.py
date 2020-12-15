@@ -16,13 +16,13 @@ from utils import flow_viz
 from utils.utils import InputPadder
 from PIL import Image
 
+# utillity fuction for no-max-suppression, that filters ambiguous bounding boxes
 def nms(dets, confidence, thresh):
     x1 = dets[:, 0].detach().cpu().numpy()
     y1 = dets[:, 1].detach().cpu().numpy()
     x2 = dets[:, 2].detach().cpu().numpy()
     y2 = dets[:, 3].detach().cpu().numpy()
     scores = confidence.detach().cpu().numpy()
-    print(scores)
     areas = (x2 - x1 + 1) * (y2 - y1 + 1)
     order = scores.argsort()[::-1]
 
@@ -45,6 +45,7 @@ def nms(dets, confidence, thresh):
 
     return keep
 
+#
 coco_names = [
     '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
     'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
@@ -124,10 +125,10 @@ while(cap.isOpened()):
     idxs = nms(boxes,confidences, IOU_THRESHOLD)
 
     for i in idxs:
-        if confidences[i] > 0.3:
+        if confidences[i] > 0.7:
             if class_id[i] in [2,3,4,6,8]:
-                color = COLORS[3]
-                cv2.rectangle(bbox, (int(boxes[i][0]), int(boxes[i][1])), (int(boxes[i][2]), int(boxes[i][3])), color, 1)
+                color = COLORS[5]
+                cv2.rectangle(bbox, (int(boxes[i][0]), int(boxes[i][1])), (int(boxes[i][2]), int(boxes[i][3])), color, 2)
     #cv2.imwrite('detection{:06d}'.format(count) +  '.png',image)
 
     ############################################################################
@@ -150,11 +151,12 @@ while(cap.isOpened()):
     flow_up = flow_viz.flow_to_image(flow_up)
     #cv2.imwrite('{:06d}'.format(count) +  '.png',flow_up)
 
-    merge = cv2.addWeighted(bbox, 0.8, flow_up, 0.5, 0)
+    merge = cv2.addWeighted(bbox, 1, flow_up, .5, 0)
     merge_img1 = np.concatenate((frame_1,bbox), axis = 0)
     merge_img2 = np.concatenate((flow_up, merge), axis = 0)
     merge_img = np.concatenate((merge_img1,merge_img2), axis = 1)
     cv2.imshow('image',merge_img)
+    cv2.waitKey(1)
     #out.write(merge_img)
     #cv2.imwrite('{:06d}'.format(count) +  '.png',merge_img)
     print('elapsed time: {}'.format(time.time()-start))
