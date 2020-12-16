@@ -45,7 +45,7 @@ def nms(dets, confidence, thresh):
 
     return keep
 
-#
+# detector class names
 coco_names = [
     '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
     'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
@@ -61,10 +61,12 @@ coco_names = [
     'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
-SCORE_THRESHOLD = 0.5
-IOU_THRESHOLD = 0.4
+# tresholding for bouding box selection
+SCORE_THRESHOLD = 0.7
+IOU_THRESHOLD = 0.5
 
 COLORS = np.random.uniform(0, 255, size=(len(coco_names), 3))
+# input form
 # python frcnn.py --model=models/raft-things.pth --path=demo-frames
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', help="restore checkpoint")
@@ -98,9 +100,9 @@ raft.to(DEVICE)
 raft.eval()
 ###############################################################################
 #ouput video setup
-h, w = current_img.shape[:2]
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out = cv2.VideoWriter("output.mp4", fourcc, 5.0, (2*w, 2*h))
+#h, w = current_img.shape[:2]
+#fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+#out = cv2.VideoWriter("output.mp4", fourcc, 5.0, (2*w, 2*h))
 ###############################################################################
 # Run until video is finished
 while(cap.isOpened()):
@@ -108,7 +110,7 @@ while(cap.isOpened()):
     start = time.time()
     # get frame
     ret, frame = cap.read()
-    frame_1 = frame
+    frame_1 = frame.copy()
     # convert image to torch tensor
     frcnn_img = transform(frame)
     # send input data to GPU
@@ -120,32 +122,32 @@ while(cap.isOpened()):
     confidences = detections[0]['scores']
     class_id = detections[0]['labels']
 
-    bbox = frame_1
+    bbox = frame
 
     idxs = nms(boxes,confidences, IOU_THRESHOLD)
 
     for i in idxs:
-        if confidences[i] > 0.7:
+        if confidences[i] > SCORE_THRESHOLD:
             if class_id[i] in [2,3,4,6,8]:
                 color = COLORS[5]
                 cv2.rectangle(bbox, (int(boxes[i][0]), int(boxes[i][1])), (int(boxes[i][2]), int(boxes[i][3])), color, 2)
-    #cv2.imwrite('detection{:06d}'.format(count) +  '.png',image)
+        #cv2.imwrite('detection{:06d}'.format(count) +  '.png',image)
 
     ############################################################################
     past_img = current_img
     current_img = frame_1
 
-    raft_img_1 = np.array(past_img).astype(np.uint8)
+    raft_img_1 = np.array(cv2.medianBlur(past_img,5)).astype(np.uint8)
     raft_img_1 = torch.from_numpy(raft_img_1).permute(2, 0, 1).float()
     raft_img_1 = raft_img_1[None].to(DEVICE)
 
-    raft_img_2 = np.array(current_img).astype(np.uint8)
+    raft_img_2 = np.array(cv2.medianBlur(current_img,5)).astype(np.uint8)
     raft_img_2 = torch.from_numpy(raft_img_2).permute(2, 0, 1).float()
     raft_img_2 = raft_img_2[None].to(DEVICE)
 
     #padder = InputPadder(raft_img_1.shape)
     #raft_img_2, raft_img_1 = padder.pad(raft_img_2, raft_img_1)
-    flow_low, flow_up = raft(raft_img_2, raft_img_1, iters=10, test_mode=True)
+    flow_low, flow_up = raft(raft_img_2, raft_img_1, iters=5, test_mode=True)
 
     flow_up = flow_up[0].permute(1,2,0).detach().cpu().numpy()
     flow_up = flow_viz.flow_to_image(flow_up)
