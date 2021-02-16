@@ -1,5 +1,7 @@
+# Get dependencies
 import sys
 import dependencies
+sys.path.append('yolo')
 sys.path.append('core')
 import math
 import glob
@@ -14,8 +16,11 @@ import torchvision.transforms as transforms
 from raft import RAFT
 from utils import flow_viz
 from utils.utils import InputPadder
+from inference import post_process
 import argparse
-from utils import flow_viz
+from model import YoloNetV3
+import matplotlib.pyplot as plt
+from datetime import datetime
 #-------------------------------------------------------------------------------
 # Parameters
 #-------------------------------------------------------------------------------
@@ -23,28 +28,25 @@ from utils import flow_viz
 media_type = 'image'
 # Location of image folder or video file
 location = 'dataset/01/'
-# Set detector model type - frcnn, yolo, sinet
-detector_type = 'frcnn'
-# Set optical flow model type - farneback, raft, flownet
-flow_type = 'raft'
-# Set output types - metrics, video, preview
-
-results_out = False
-time_out = True
-video_out = False
+# Set xml to true if ground truth data is in xml and False to txt file
+xml = False
+# Export results in video file
+video_out = True
+# Show Result in a pop up window frame by frame
 preview_result = False
+# Calculate and output metrics
 metrics_out = True
-performance = [0,0,0]
+# Initialize regions of no interest
+regions = []
 #---------------------------------------------------------------
 # Global Variables
 #---------------------------------------------------------------
-ID = 1
-FRAME_NUMBER = 2
-SCORE_THRESHOLD = 0.5
-IOU_THRESHOLD = 0.5
+# Detector IoU treshold
+IOU_THRESHOLD = 0.4
+# Metrics IoU Treshold
+EVAL_TRESHOLD = 0.5
+# Select GPU as target
 DEVICE = 'cuda'
-IMG_X_MAX = 320
-IMG_Y_MAX = 240
 
 #---------------------------------------------------------------
 # Input Image Sequence Handler Class
@@ -54,10 +56,12 @@ class InputData:
     def __init__(self, media_type, location):
         self.type = media_type
         if self.type == 'image':
+            # get image file list and sort by filename
             self.images = glob.glob(os.path.join(location, '*.png'))
             self.images = sorted(self.images)
 
         if self.type == 'video':
+            # Start video object
             self.images = cv2.VideoCapture(location)
     # Helper function to get next frame in sequence of iamges or video
     def get_next_frame(self):
@@ -65,16 +69,17 @@ class InputData:
             if self.type == 'image':
                 imfile = self.images[FRAME_NUMBER]
                 image = np.array(Image.open(imfile)).astype(np.uint8)
-                image = cv2.resize(image, (320,240), interpolation = cv2.INTER_AREA)
+                #image = cv2.resize(image, (320,240), interpolation = cv2.INTER_AREA)
                 return image
 
             if self.type == 'video':
                 _, image = self.images.read()
-                image = cv2.resize(image, (320,240), interpolation = cv2.INTER_AREA)
+                #image = cv2.resize(image, (320,240), interpolation = cv2.INTER_AREA)
                 return image
         # In case reach end of sequence
         except:
             return False
+
 
 #---------------------------------------------------------------
 #---------------------------------------------------------------
@@ -86,6 +91,7 @@ class Vehicle:
         self.x, self.y, self.w, self.h = detection
         self.x_dot, self.y_dot = flow
         self.first_frame = FRAME_NUMBER
+        self.gt_id = []
         self.last_seen = 0
         self.veh_id = ID
         ID = ID + 1
@@ -93,27 +99,43 @@ class Vehicle:
     def update_full(self, frame_number, detection, flow):
         x, y, self.w, self.h = detection
         self.last_seen = 0
-        self.x = self.x * 0.2 + x * 0.8 
-        self.y = self.y * 0.2 + y * 0.8 
-        self.x_dot, self.y_dot = flow
+        self.x_dot = x - self.x
+        self.y_dot = y - self.y
+        self.x = x
+        self.y = y
 
     def update_partial(self, flow):
         self.last_seen += 1
-        self.x_dot = self.x_dot *0.2 +flow[0] *0.8
-        self.y_dot = self.y_dot *0.2 +flow[1] *0.8
+        #self.x_dot = self.x_dot *0.1 
+        #self.y_dot = self.y_dot *0.1 +flow[1] *0.9
 
     def predict(self):
         self.x = self.x + self.x_dot
         self.y = self.y + self.y_dot
 
     def bounds(self):
-        if self.last_seen > 3:
+        for region in regions:
+            if iou(region, [self.x, self.y, self.x+self.w, self.y+self.h])>0.7:
+                return False
+        if self.last_seen > 5:
             return False
-
         if self.x < IMG_X_MAX and self.x > 0  and self.y > 0 and self.y < IMG_Y_MAX:
             return True
         else:
             return False
+    
+    def check_id(self, gt_id):
+        if self.gt_id == []:
+            self.gt_id.append(gt_id)
+            return 0
+        
+        if gt_id in self.gt_id:
+            return 0
+        else:
+            self.gt_id.append(gt_id)
+            return 1
+
+
 #---------------------------------------------------------------
 #---------------------------------------------------------------
 #---------------------------------------------------------------
@@ -130,18 +152,26 @@ class Frame:
         FRAME_NUMBER = FRAME_NUMBER + 1
 
     def match(self):
-        error = np.zeros((len(self.bounding_boxes),len(self.prior_vehicles)))
-        for i in range(len(self.bounding_boxes)):
-            for j in range(len(self.prior_vehicles)):
-                error[i][j] = np.sqrt((self.bounding_boxes[i][0]-self.prior_vehicles[j].x)**2+(self.bounding_boxes[i][1]-self.prior_vehicles[j].y)**2)
+        iou_matrix = np.zeros((len(self.bounding_boxes),len(self.prior_vehicles)))
+        i = 0
+        j = 0
+        for box in self.bounding_boxes:
+            for vehicle in self.prior_vehicles:
+                vehicle_box = [vehicle.x, vehicle.y, vehicle.w + vehicle.x, vehicle.h + vehicle.y]
+                detection_box = [box[0], box[1], box[0]+box[2], box[1]+box[3]]
+                iou_matrix[i][j] = iou(detection_box , vehicle_box)
+                j += 1
+            i += 1
+            j = 0
+
         full = 0
         initialize = 0
         partial = 0
 
         for i in range(len(self.bounding_boxes)):
-            if min(error[i]) < 7.0:
+            if max(iou_matrix[i]) > 0.5:
                 full += 1
-                idx = int(np.where(error[i] == error[i].min())[0])
+                idx = int(np.where(iou_matrix[i] == iou_matrix[i].max())[0][0])
                 self.measurement[self.prior_vehicles[idx].veh_id] = ['full',self.bounding_boxes[i], self.average_flow(self.bounding_boxes[i]), self.prior_vehicles[idx]]
             else:
                 initialize += 1
@@ -199,8 +229,11 @@ class Detector:
             # set transformation to prepare image for network input
             self.transform = transforms.Compose([transforms.ToTensor()])
         if type == 'yolo':
+            weight_path = 'weights/yolov3_original.pt'
             # load faster r-cnn
-            self.detector = models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+            self.detector = YoloNetV3(nms=False)
+            # load weights
+            self.detector.load_state_dict(torch.load(weight_path))
             # send model to gpu
             self.detector.to(DEVICE)
             # set model to inference mode
@@ -221,19 +254,24 @@ class Detector:
             boxes = detections[0]['boxes']
             confidence = detections[0]['scores']
             class_id = detections[0]['labels']
-
-
+            self.result = self.filter_detection(boxes, confidence, class_id)
 
         if self.type == 'yolo':
             # convert image to torch tensor
-            input = self.transform(image)
+            im = Image.fromarray(image)
+            input = self.transform(im.resize((IMG_X_MAX,IMG_X_MAX),Image.ANTIALIAS))
+            input = input.unsqueeze(0)
             # send input data to GPU
             input = input.to(DEVICE)
             # process inference and get detections
-            detections = self.detector([input])
-            boxes = detections[0]['boxes']
-            confidence = detections[0]['scores']
-            class_id = detections[0]['labels']
+            with torch.no_grad():
+                detections = self.detector(input)
+            detections = post_process(detections, True, SCORE_THRESHOLD, IOU_THRESHOLD)
+            for detection in detections:
+                detection[..., :4] = untransform_bboxes(detection[..., :4])
+                cxcywh_to_xywh(detection)
+            boxes = detections[0][..., :4]
+            self.result = boxes.detach().cpu().numpy()
 
         if self.type == 'sinet':
             # convert image to torch tensor
@@ -246,8 +284,6 @@ class Detector:
             confidence = detections[0]['scores']
             class_id = detections[0]['labels']
 
-
-        self.result = self.filter_detection(boxes, confidence, class_id)
 
     def filter_detection(self, detections, confidence, class_id):
         x1 = detections[:, 0].detach().cpu().numpy()
@@ -276,7 +312,7 @@ class Detector:
             order = order[inds + 1]
         filter = []
         for i in keep:
-            if confidence[i] > SCORE_THRESHOLD:
+            if confidence[i] >= SCORE_THRESHOLD:
                 if class_id[i] in [2,3,4,6, 7, 8]:
                     filter.append([int(x1[i]), int(y1[i]), int(x2[i]-x1[i]), int(y2[i]-y1[i])])
         return filter
@@ -288,8 +324,7 @@ class OpticalFlow:
     def __init__(self, type):
         self.type = type
         if type == 'farneback':
-
-            print('Farneback')
+            self.type = 'farneback'
 
         if type == 'raft':
             parser = argparse.ArgumentParser()
@@ -313,7 +348,15 @@ class OpticalFlow:
 
     def inference(self,image1,image2):
         if self.type == 'farneback':
-            self.flow = True
+            self.mask = np.zeros_like(image1)
+            gray1 = cv2.cvtColor(image1, cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(image2, cv2.COLOR_BGR2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(gray1, gray2, flow=None,
+                                      pyr_scale=0.5, levels=10, winsize=15,
+                                      iterations=10, poly_n=7, poly_sigma=1.5,
+                                      flags=cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
+            self.result = flow
+
         if self.type == 'raft':
             image1 = torch.from_numpy(image1).permute(2, 0, 1).float()
             image1 = image1[None].to(DEVICE)
@@ -330,12 +373,22 @@ class OpticalFlow:
             self.flow = True
 
     def toimage(self):
-        image = flow_viz.flow_to_image(self.result)
-        return image
+        if self.type == 'raft':
+            image = flow_viz.flow_to_image(self.result)
+            return image
+        if self.type == 'farneback':
+            magnitude, angle = cv2.cartToPolar(self.result[..., 0], self.result[..., 1])
+            mask = self.mask
+            mask[..., 1] = 255
+            mask[..., 0] = angle * 180 / np.pi / 2
+            mask[..., 2] = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)
+            image = cv2.cvtColor(mask, cv2.COLOR_HSV2BGR)
+            return image
+
+            
 #---------------------------------------------------------------
 # Helper functions
 #---------------------------------------------------------------
-
 # draw vehicle bounding box on input image
 def draw_bbox(image, bboxes):
     copy = np.copy(image)
@@ -353,10 +406,10 @@ def flow_mask(flow, bboxes):
     return image
 
 # create side by side images
-def visuzalization(input, bbox, flow):
-    bbox_img = draw_bbox(input, bbox)
-    flow_visualization = flow.toimage()
-    mask = flow_mask(flow, bbox)
+def visuzalization(input, bbox, flow, expected):
+    bbox_img = cv2.resize(draw_evaluation(input, expected, bbox), (IMG_X_MAX, IMG_Y_MAX), interpolation = cv2.INTER_AREA)
+    flow_visualization = cv2.resize(flow.toimage(), (IMG_X_MAX, IMG_Y_MAX), interpolation = cv2.INTER_AREA)
+    mask = cv2.resize(flow_mask(flow, bbox), (IMG_X_MAX, IMG_Y_MAX), interpolation = cv2.INTER_AREA)
 
     img1 = np.concatenate((input,bbox_img), axis = 1)
     img2 = np.concatenate((flow_visualization, mask), axis = 1)
@@ -366,7 +419,7 @@ def visuzalization(input, bbox, flow):
 # update output image window
 def display_result(image):
     cv2.imshow('image',image)
-    cv2.waitKey(1)
+    cv2.waitKey(0)
 
 def iou(boxA, boxB):
     # determine the (x, y)-coordinates of the intersection rectangle
@@ -393,147 +446,274 @@ def iou(boxA, boxB):
     return iou
 
 def evaluate(gt , result):
+
+    if len(result) == 0:
+        return [0,len(gt),0, 0]
+
     iou_result = np.zeros((len(gt),len(result)), dtype=float)
     for i in range(len(gt)):
         for j in range(len(result)):
-            box1 = [gt[i][2], gt[i][3], gt[i][4] , gt[i][5] ]
-            box2 = [result[j][1], result[j][2], result[j][3] , result[j][4]]
+            box1 = [gt[i][2], gt[i][3], gt[i][4] , gt[i][5]]
+            box2 = [result[j].x, result[j].y, result[j].w +result[j].x, result[j].h+result[j].y]
             iou_result[i,j] = iou(box1, box2)
     tp = 0
     fn = 0
     fp = 0
+    ids = 0
 
     for i in range(len(gt)):
-        if max(iou_result[i,:]) >= 0.7:
+        if max(iou_result[i,:]) >= EVAL_TRESHOLD:
             tp += 1
+            idx = np.where(iou_result[i] == iou_result[i].max())
+            ids += result[int(idx[0][0])].check_id(gt[i][0])
         else:
             fn += 1
     
     for j in range(len(result)):
-        if max(iou_result[:,j]) < 0.7:
+        if max(iou_result[:,j]) < EVAL_TRESHOLD:
             fp += 1
     
-    return [tp , fn ,fp]
+    return [tp, fn, fp, ids]
+
+def draw_evaluation(input, gt, result):
+    iou_result = np.zeros((len(gt),len(result)), dtype=float)
+    for i in range(len(gt)):
+        for j in range(len(result)):
+            box1 = [gt[i][2], gt[i][3], gt[i][4] , gt[i][5] ]
+            box2 = [result[j][0], result[j][1], result[j][2] , result[j][3]]
+            iou_result[i,j] = iou(box1, box2)
+    copy = np.copy(input)
+
+    for i in range(len(gt)):
+        if max(iou_result[i,:]) >= EVAL_TRESHOLD:
+            idx = int(np.where(iou_result[i] == iou_result[i].max())[0][0])
+            cv2.rectangle(copy, (int(result[idx][0]), int(result[idx][1])), (int(result[idx][2]), int(result[idx][3])), (255,0,0) , 2)
+        else:
+            cv2.rectangle(copy, (int(gt[i][2]), int(gt[i][3])), (int(gt[i][4]), int(gt[i][5])), (0,255,0), 2)
+    
+    for j in range(len(result)):
+        if max(iou_result[:,j]) < EVAL_TRESHOLD:
+            cv2.rectangle(copy, (int(result[j][0]), int(result[j][1])), (int(result[j][2]), int(result[j][3])), (0,0,255), 2)
+    return copy
 
 
-#-------------------------------------------------------------------------------
-# INITIALIZE INPUT DATA --------------------------------------------------------
-#-------------------------------------------------------------------------------
-input = InputData(media_type, location)
-current_frame = input.get_next_frame()
-# INITIALIZE DETECTOR
-detector = Detector(detector_type)
-detector.inference(current_frame)
-inital_veh = []
-for detection in detector.result:
-    vehicle = Vehicle(FRAME_NUMBER, detection, [0 ,0])
-    inital_veh.append(vehicle)
-# INITIALIZE Optical Flow
-flow = OpticalFlow(flow_type)
-#-------------------------------------------------------------------------------
-if video_out:
-    h, w = current_frame.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter("output_.mp4", fourcc, 5.0, (4*w, h))
-#-------------------------------------------------------------------------------
-if results_out:
-    result_text = open(location + 'output.txt','w')
-    # open csv file
-#-------------------------------------------------------------------------------
-if metrics_out:
-    gt_text = open(location + 'gt.txt','r')
-    gt_text = gt_text.readlines()
-    gt = []
-    for line in gt_text:
-        data = line.split(',')
-        gt.append([int(data[0]), int(data[1]), float(data[2]), float(data[3]), float(data[4])+ float(data[2]), float(data[5]) + float(data[3])])
+def untransform_bboxes(bboxes):
+    """transform the bounding box from the scaled image back to the unscaled image."""
+    x = bboxes[..., 0]
+    y = bboxes[..., 1]
+    w = bboxes[..., 2]
+    h = bboxes[..., 3]
+    # x, y, w, h = bbs
+    x /= 1
+    y /= IMG_X_MAX/IMG_Y_MAX
+    w /= 1
+    h /= IMG_X_MAX/IMG_Y_MAX
+    return bboxes
 
-    # open csv file
-#-------------------------------------------------------------------------------
-if time_out:
-    times = []
-#-------------------------------------------------------------------------------
-# MAIN LOOP
-#-------------------------------------------------------------------------------
-while(current_frame is not False):
-    #print('Frame No: ' + str(FRAME_NUMBER) + '  Veh. No.: ' + str(ID))
-    # read Image
-    if time_out:
-        start = time.time()
-    # get image pair
-    previous_frame = current_frame
-    current_frame  = input.get_next_frame()
-    # check if reached end frame
-    if current_frame is False:
-        break
-    # run detection
-    detector.inference(current_frame)
-    # run flow
-    flow.inference(previous_frame, current_frame)
-    # create frame
-    if FRAME_NUMBER == 2: # first pair
-        frame = Frame(detector.result, flow.result, inital_veh)
-    else:
-        frame = Frame(detector.result, flow.result, frame.predict_veh)
-    # match
-    frame.match()
-    # update
-    frame.update()
-    # predict
-    frame.predict()
-
-    #############################################################################################################################
-    # LOGGING RESULTS 
-    #############################################################################################################################
-
-    if time_out:
-        processing_time = time.time()-start
-        times.append(processing_time)
-        #print('elapsed time: {}'.format(processing_time))
-
-    if results_out:
-        for vehicle in frame.predict_veh:
-            line = str(frame.frame_number) + ',' + str(vehicle.veh_id) + ',' + str(int(vehicle.x)) +  ',' + str(int(vehicle.y)) + ',' + str(int(vehicle.w)) + ',' + str(int(vehicle.h)) + '\n'
-            result_text.writelines((line))
-
-    if metrics_out:
-        expected = [item for item in gt if item[0] == FRAME_NUMBER]
-        result = []
-        for vehicle in frame.predict_veh:
-            result.append([vehicle.veh_id , vehicle.x , vehicle.y, vehicle.w +vehicle.x , vehicle.h+vehicle.y])
-        tp, tn , fp = evaluate(expected , result)
-        performance[0] += tp
-        performance[1] += tn
-        performance[2] += fp
-        #print(str(FRAME_NUMBER) + ' | TP : ' + str(tp) + ' | TN : ' + str(tn) + ' | FP : ' + str(fp))
-
-    if video_out:
-        image = visuzalization(current_frame, frame.get_bbox(), flow)
-        out.write(image)
-
-    if preview_result:
-        image = visuzalization(current_frame, frame.get_bbox(), flow)
-        display_result(image)
-
-###################################################################################################################################
-# HANDLING CLOSURES
-###################################################################################################################################
-
-if media_type == 'video':
-    input.images.release()
-
-if preview_result:
-    cv2.destroyAllWindows()
-
-if time_out:
-    average = 1/np.average(times)
-    print ('Average Frames Per Second: ' + str(average))
+def cxcywh_to_xywh(bbox):
+    bbox[..., 0] -= bbox[..., 2] / 2
+    bbox[..., 1] -= bbox[..., 3] / 2
+    return bbox
 
 if metrics_out:
-    precision =  performance[0] / (performance[0] + performance[2])
-    recall = performance[0] / (performance[0] + performance[1])
-    print ('Precision: ' + str(precision))
-    print ('Recall: ' + str(recall))
+    now = datetime.now()
+    now = now.strftime('%Y%m%d_%H-%M')
+    result_text = open(location + now + '.txt','w')
+    line = 'DETECTOR' + ','+'FLOW' + ',' + 'SCORE_THRESHOLD' + ',' +  'PRECISION' + ',' + 'RECALL' + ',' + 'MOTA' + ',' + 'FPS' + '\n'
+    result_text.writelines((line))
+    # open csv file
 
-if results_out:
+results = []
+for detector_type in ['frcnn', 'yolo']:
+    for flow_type in ['raft', 'farneback']:
+        metrics_all = []
+        print('---------------------------------------------------------------')
+        print('Detector: ' + detector_type)
+        print('Flow: ' + flow_type)
+        print('---------------------------------------------------------------')
+        for SCORE_THRESHOLD in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+            performance = [0,0,0,0]
+            print('Score Treshold: ' + str(SCORE_THRESHOLD))
+            if detector_type == 'yolo' and SCORE_THRESHOLD ==0:
+                SCORE_THRESHOLD = 0.001
+            print('---------------------------------------------------------------')
+            ID = 1
+            FRAME_NUMBER = 2
+            #-------------------------------------------------------------------------------
+            # INITIALIZE INPUT DATA --------------------------------------------------------
+            #-------------------------------------------------------------------------------
+            input = InputData(media_type, location)
+            current_frame = input.get_next_frame()
+
+            # INITIALIZE DETECTOR
+            detector = Detector(detector_type)
+            detector.inference(current_frame)
+            inital_veh = []
+
+            for detection in detector.result:
+                vehicle = Vehicle(FRAME_NUMBER, detection, [0 ,0])
+                inital_veh.append(vehicle)
+            # INITIALIZE Optical Flow
+            flow = OpticalFlow(flow_type)
+            #-------------------------------------------------------------------------------
+            if video_out:
+                h, w = current_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                name = detector_type+'-'+flow_type+ '-' + str(SCORE_THRESHOLD) + '.mp4'
+                out = cv2.VideoWriter(os.path.join(location, name), fourcc, 5.0, (4*w, h))
+            #-------------------------------------------------------------------------------
+            
+            #-------------------------------------------------------------------------------
+            if metrics_out:
+                if xml:
+                    import xml.etree.ElementTree as ET
+                    root = ET.parse(os.path.join(location, 'gt.xml')).getroot()
+                    gt = []
+                    for frame in root.findall('frame'):
+                        frame_id = frame.get('num')
+                        vehicles = frame.find('target_list')
+                        for vehicle in vehicles:
+                            veh_id = vehicle.get('id')
+                            x = vehicle.find('box').get('left')
+                            y = vehicle.find('box').get('top')
+                            w = vehicle.find('box').get('width')
+                            h = vehicle.find('box').get('height')
+                            gt.append([int(frame_id), int(veh_id), float(x), float(y), float(w)+float(x), float(h)+float(y)])
+                    for region in root.find('ignored_region').findall('box'):
+                        regions.append([float(region.get('left')),float(region.get('top')),float(region.get('left'))+float(region.get('width')),float(region.get('top'))+float(region.get('height'))])
+                else:
+                    gt_text = open(location + 'gt.txt','r')
+                    gt_text = gt_text.readlines()
+                    gt = []
+                    for line in gt_text:
+                        data = line.split(',')
+                        gt.append([int(data[0]), int(data[1]), float(data[2]), float(data[3]), float(data[4])+ float(data[2]), float(data[5]) + float(data[3])])
+
+                # open csv file
+            #-------------------------------------------------------------------------------
+            if metrics_out:
+                times = []
+            #-------------------------------------------------------------------------------
+            # MAIN LOOP
+            #-------------------------------------------------------------------------------
+            while(current_frame is not False):
+                #print('Frame No: ' + str(FRAME_NUMBER) + '  Veh. No.: ' + str(ID))
+                # read Image
+                if metrics_out:
+                    start = time.time()
+                # get image pair
+                previous_frame = current_frame
+                current_frame  = input.get_next_frame()
+                # check if reached end frame
+                if current_frame is False:
+                    break
+                IMG_Y_MAX, IMG_X_MAX, _ = current_frame.shape
+                # run detection
+                detector.inference(current_frame)
+                # run flow
+                flow.inference(current_frame, previous_frame)
+                # create frame
+                if FRAME_NUMBER == 2: # first pair
+                    frame = Frame(detector.result, flow.result, inital_veh)
+                else:
+                    frame.predict()
+                    frame = Frame(detector.result, flow.result, frame.predict_veh)
+                # match
+                frame.match()
+                # update
+                frame.update()
+
+                #############################################################################################################################
+                # LOGGING RESULTS 
+                #############################################################################################################################
+
+
+                if metrics_out:
+                    processing_time = time.time()-start
+                    times.append(processing_time)
+                    #print('elapsed time: {}'.format(processing_time))
+
+                    expected = [item for item in gt if item[0] == FRAME_NUMBER]
+                    #result = []
+                    #for vehicle in frame.update_veh:
+                    #    result.append([vehicle.veh_id , vehicle.x , vehicle.y, vehicle.w +vehicle.x , vehicle.h+vehicle.y])
+                    tp, fn , fp, ids = evaluate(expected , frame.update_veh)
+                    performance[0] += tp
+                    performance[1] += fn
+                    performance[2] += fp
+                    performance[3] += ids
+                    #print(str(FRAME_NUMBER) + ' | TP : ' + str(tp) + ' | FN : ' + str(fn) + ' | FP : ' + str(fp))
+
+                if video_out:
+                    expected = [item for item in gt if item[0] == FRAME_NUMBER]
+                    image = visuzalization(current_frame, frame.get_bbox(), flow, expected)
+                    out.write(image)
+
+                if preview_result:
+                    expected = [item for item in gt if item[0] == FRAME_NUMBER]
+                    image = visuzalization(current_frame, frame.get_bbox(), flow, expected)
+                    display_result(image)            
+
+            ###################################################################################################################################
+            # HANDLING CLOSURES
+            ###################################################################################################################################
+
+            if media_type == 'video':
+                input.images.release()
+
+            if preview_result:
+                cv2.destroyAllWindows()
+
+
+            if metrics_out:
+                #print('RESULTS @ IoU Treshold ' + str(EVAL_TRESHOLD))
+                try:
+                    precision =  performance[0] / (performance[0] + performance[2])
+                except:
+                    precision = 0.0
+                
+                try:
+                    recall = performance[0] / (performance[0] + performance[1])
+                except:
+                    recall = 0.0
+
+                try:
+                    mota = 1 - (performance[1] + performance[2] + performance[3])/ (performance[0] + performance[1])
+                except:
+                    mota = 0.0
+                
+
+                metrics_all.append([recall,precision,mota])
+
+
+                average = 1/np.average(times)
+
+                print ('Average Frames Per Second: ' + str(average))
+                print ('Precision: ' + str(precision))
+                print ('Recall: ' + str(recall))
+                print ('MOTA: ' + str(mota))
+                print ('###############################################################')
+                line = detector_type + ','+ flow_type + ',' + str(SCORE_THRESHOLD) + ',' +  str(precision) + ',' + str(recall) + ',' + str(mota) + ',' + str(average) + '\n'
+                result_text.writelines((line))
+            
+        if metrics_out:
+            axis = [0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]
+            metrics_all.sort()
+            metrics_all = np.array(metrics_all)
+            corrected_precision = np.interp(axis,metrics_all[:,0],metrics_all[:,1] )
+            AP = np.average(corrected_precision)
+            print ('Average Precision: ' + str(AP))
+            print ('###############################################################')
+            print ('###############################################################')
+
+            import matplotlib.pyplot as plt
+            plt.scatter(axis, corrected_precision)
+            plt.plot(axis,corrected_precision)
+            plt.title(detector_type + ' - ' + flow_type)
+            plt.xlabel("recall")
+            plt.ylabel("Precision")
+            plt.show()
+            
+
+if metrics_out:
     result_text.close()
